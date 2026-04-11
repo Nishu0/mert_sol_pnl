@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.helius.dev)",
+      "Bash(cargo init:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo run:*)",
+      "Bash(kill %1)",
+      "Bash(pkill -f \"target/release/sol-pnl\")",
+      "Bash(curl -s -X POST 'https://mainnet.helius-rpc.com/?api-key=37385d13-ceb2-433e-b419-0aa52b7b7fd6' -H 'Content-Type: application/json' -d '{:*)",
+      "Bash(python3 -m json.tool)",
+      "Bash(kill 18182)",
+      "Bash(kill 19356)",
+      "Bash(python3 -c \"import sys,json; r=json.load\\(sys.stdin\\); d=r.get\\('result',{}\\).get\\('data',[]\\); print\\(f'first: {d[0][\\\\\"blockTime\\\\\"] if d else \\\\\"none\\\\\"}'\\)\")",
+      "Bash(python3 -c \"import sys,json; r=json.load\\(sys.stdin\\); d=r.get\\('result',{}\\).get\\('data',[]\\); print\\(f'last: {d[0][\\\\\"blockTime\\\\\"] if d else \\\\\"none\\\\\"}'\\)\")",
+      "WebSearch",
+      "Bash(bun add:*)",
+      "Bash(rm -rf /Users/nisargthakkar/Projects/mert/web)",
+      "Bash(bunx create-next-app@latest web --typescript --tailwind --eslint --app --src-dir --no-import-alias --use-bun)",
+      "Bash(curl:*)",
+      "Bash(./target/release/sol-pnl serve:*)",
+      "Bash(lsof -ti:3001)",
+      "Bash(xargs kill:*)",
+      "Bash(bun run:*)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'Points: {len\\(d.get\\(\\\\\"points\\\\\",[]\\)\\)}, Duration: {d.get\\(\\\\\"fetch_duration_ms\\\\\"\\)}ms, Calls: {d.get\\(\\\\\"rpc_calls\\\\\"\\)}'\\)\")",
+      "Bash(open:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git reset:*)",
+      "Bash(GIT_AUTHOR_DATE=\"2026-04-11T20:00:00\" GIT_COMMITTER_DATE=\"2026-04-11T20:00:00\" git commit -m \"init project scaffold with readme and rust setup\")"
+    ]
+  }
+}
