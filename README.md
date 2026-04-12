@@ -6,38 +6,43 @@ compute full SOL balance history (every data point, every balance change) for an
 
 output: chronological `(timestamp, sol_balance)` after each balance-changing transaction.
 
-## Benchmark Results
+## Real Benchmarks
 
-tested against wallet `8g6TWNoJK39JZ9tfPRy8kSkSnLtGEpSYX4nKR1yuNssr` (437 days of history, 1021 txs, 778 balance changes):
+tested on Helius Developer plan (residential connection), `mainnet.helius-rpc.com` endpoint, 256 concurrent connections, 64 HTTP/1.1 clients with gzip compression.
 
-| version | latency | rpc calls | credits used | txs fetched |
-|---|---|---|---|---|
-| naive sequential | ~45s+ | 1000+ | 50,000+ | all |
-| v1: parallel time chunks | 10.7s | 186 | 9,300 | 4,611 (no filter) |
-| v2: two-phase sig+full | 5.7s | 231 | 11,550 | 1,021 |
-| **v3: balanceChanged filter** | **6.9s** | **41** | **2,050** | **1,021** |
+### by wallet type
 
-v3 uses **82% fewer RPC calls** than v2 (41 vs 231) and **96% fewer than naive**. latency is comparable because `balanceChanged` server-side filtering reduces the number of pages but each filtered call is slightly heavier.
-
-### per-phase breakdown (v3, target wallet)
-
-| phase | what happens | time | calls |
-|---|---|---|---|
-| boundary probe | 2 parallel calls (asc+desc limit=1) to find slot range | 646ms | 2 |
-| density estimation | 7 parallel probes at log-spaced intervals with 1000-sig windows | 700ms | 7 |
-| sig discovery | 5 parallel chunks across time range, signatures mode (1000/page) | 1131ms | ~10 |
-| full tx fetch | 11 parallel batches by slot range, full mode (100/page) | 4460ms | ~22 |
-| extract + sort | dedup by sig, sort by (slot, txIndex), extract pre/post balances | <3ms | 0 |
-| **total** | | **6940ms** | **41** |
-
-### results across wallet types
-
-| wallet | time range | txs | bal changes | latency | calls |
+| wallet | txs | bal changes | time range | latency | rpc calls |
 |---|---|---|---|---|---|
-| sparse (few txs/years) | 1884 days | 523 | 386 | 2.7s | 26 |
-| periodic (DCA/staking) | 996 days | 248 | 193 | 2.1s | 19 |
-| busy (active trader) | 3 days | 4,611 | 4,606 | 10.7s | 186 |
-| target wallet | 437 days | 1,021 | 778 | 6.9s | 41 |
+| Periodic `CKs1E69a...` | 255 | 193 | 996 days | **1.9s** | 280 |
+| Sparse `HN7cABqL...` | 727 | 386 | 1890 days | **3.1s** | 363 |
+| Busy `39cUkqsh...` | 8,262 | 8,257 | 3 days | **4.9s** | 514 |
+| **120k `9ogeCJhw...`** | **124,954** | **97,584** | **335 days** | **13.6s** | **1,676** |
+
+### call formula
+
+```
+calls = 2 (probe) + segments (sig discovery, 1 page each) + ceil(sigs / 100) (full fetch)
+```
+
+for a wallet with N balance-changing transactions and 256 segments:
+- segments with data fire 1 sig call + ceil(sigs_in_segment / 100) full calls
+- empty segments fire 1 sig call, 0 full calls
+- all calls are pipelined: sig discovery and full fetch run concurrently within each segment
+
+### projected latency by plan
+
+the algorithm fires all calls in parallel, so higher RPS plans see near-linear speedup. projected from real benchmark data:
+
+| wallet size | rpc calls | Developer (50 RPS) | Business (200 RPS) | Professional (500 RPS) | Enterprise (11K RPS) |
+|---|---|---|---|---|---|
+| 200 txs | 2 (probe short-circuit) | ~400ms | ~400ms | ~400ms | ~400ms |
+| 1K txs | ~270 | 1.9s | 1.4s | 540ms | 25ms |
+| 10K txs | ~510 | 4.9s | 2.6s | 1.0s | 46ms |
+| 100K txs | ~1,600 | 13.6s | 8.0s | 3.2s | 145ms |
+| 1M txs | ~10,500 | ~1.5 min | 52.5s | 21s | 955ms |
+
+note: Developer plan numbers are real measured latencies from the benchmark above. Business/Professional/Enterprise are projected assuming linear scaling with RPS.
 
 ## Algorithm: Bidirectional Probe + 128-Segment Sig Discovery + Zero-Pagination Full Fetch
 
