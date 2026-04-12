@@ -13,6 +13,14 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 use tower_http::cors::CorsLayer;
 
+// ── Constants ─────────────────────────────────────────────────────────────
+
+const FULL_PAGE_LIMIT: u32 = 100;
+const SIG_PAGE_LIMIT: u32 = 1000;
+const INITIAL_SEGMENTS: usize = 128;
+const MAX_SIGS: usize = 200_000;        // Cap sig discovery to avoid token-heavy wallets
+const MAX_FULL_BATCHES: usize = 2048;   // Cap parallel full fetches to avoid rate limits
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -24,7 +32,7 @@ struct BalancePoint {
     sol_balance: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct PhaseLog {
     phase: String,
     message: String,
@@ -56,11 +64,16 @@ struct RpcResult {
 
 // ── RPC Client ─────────────────────────────────────────────────────────────
 
+const NUM_CLIENTS: usize = 16; // Multiple HTTP clients = multiple TCP connections
+
 struct HeliusClient {
-    client: Client,
+    clients: Vec<Client>,
     endpoint: String,
     call_count: AtomicU32,
+    next_client: AtomicU32,
     semaphore: Semaphore,
+    retry_count: AtomicU32,
+    slow_count: AtomicU32,
 }
 
 impl HeliusClient {
@@ -70,20 +83,39 @@ impl HeliusClient {
         } else {
             format!("{}/?api-key={}", rpc_url.trim_end_matches('/'), api_key)
         };
+        // Create multiple HTTP clients — each gets its own TCP connection pool.
+        // HTTP/2 multiplexes all requests over 1 connection per client.
+        // N clients = N connections = N parallel pipes, mimicking HTTP/1.1 with N sockets.
+        let clients: Vec<Client> = (0..NUM_CLIENTS)
+            .map(|_| {
+                Client::builder()
+                    .pool_max_idle_per_host(max_concurrent / NUM_CLIENTS + 1)
+                    .tcp_keepalive(std::time::Duration::from_secs(30))
+                    .gzip(true)
+                    .brotli(true)
+                    .deflate(true)
+                    .http2_initial_stream_window_size(2 * 1024 * 1024)
+                    .http2_initial_connection_window_size(16 * 1024 * 1024)
+                    .http2_adaptive_window(true)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
         Self {
-            client: Client::builder()
-                .pool_max_idle_per_host(max_concurrent)
-                .tcp_keepalive(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap(),
+            clients,
             endpoint,
             call_count: AtomicU32::new(0),
+            next_client: AtomicU32::new(0),
             semaphore: Semaphore::new(max_concurrent),
+            retry_count: AtomicU32::new(0),
+            slow_count: AtomicU32::new(0),
         }
     }
 
     fn reset_calls(&self) {
         self.call_count.store(0, Ordering::Relaxed);
+        self.retry_count.store(0, Ordering::Relaxed);
+        self.slow_count.store(0, Ordering::Relaxed);
     }
 
     fn calls(&self) -> u32 {
@@ -98,9 +130,12 @@ impl HeliusClient {
         limit: u32,
         pagination_token: Option<&str>,
         filters: Option<Value>,
+        use_balance_filter: bool,
     ) -> Result<(Vec<Value>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
         let _permit = self.semaphore.acquire().await?;
         self.call_count.fetch_add(1, Ordering::Relaxed);
+        let client_idx = (self.next_client.fetch_add(1, Ordering::Relaxed) as usize) % self.clients.len();
+        let client = &self.clients[client_idx];
 
         let mut opts = json!({
             "transactionDetails": tx_details,
@@ -108,12 +143,10 @@ impl HeliusClient {
             "limit": limit,
             "maxSupportedTransactionVersion": 0,
         });
-        if tx_details == "full" {
-            opts["encoding"] = json!("jsonParsed");
-        }
         let mut filter_obj = filters.unwrap_or(json!({}));
-        // always use balanceChanged to only get txs that moved SOL
-        filter_obj["tokenAccounts"] = json!("balanceChanged");
+        if use_balance_filter {
+            filter_obj["tokenAccounts"] = json!("balanceChanged");
+        }
         opts["filters"] = filter_obj;
         if let Some(token) = pagination_token {
             opts["paginationToken"] = json!(token);
@@ -126,39 +159,78 @@ impl HeliusClient {
             "params": [address, opts],
         });
 
-        let resp = self
-            .client
-            .post(&self.endpoint)
-            .json(&body)
-            .send()
-            .await?
-            .json::<RpcResponse>()
-            .await?;
+        // Retry up to 5 times with exponential backoff
+        let call_start = Instant::now();
+        let mut last_err = String::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                self.retry_count.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
+            }
+            let result = client
+                .post(&self.endpoint)
+                .json(&body)
+                .send()
+                .await;
 
-        if let Some(err) = resp.error {
-            return Err(format!("RPC error: {}", err).into());
+            let resp = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = e.to_string();
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                last_err = "429 rate limited".to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(1000 * (1 << attempt))).await;
+                continue;
+            }
+            if status.is_server_error() {
+                last_err = format!("server error {}", status);
+                continue;
+            }
+
+            match resp.json::<RpcResponse>().await {
+                Ok(parsed) => {
+                    let elapsed = call_start.elapsed().as_millis();
+                    if elapsed > 2000 {
+                        self.slow_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(err) = parsed.error {
+                        return Err(format!("RPC error: {}", err).into());
+                    }
+                    return match parsed.result {
+                        Some(r) => Ok((r.data, r.pagination_token)),
+                        None => Ok((vec![], None)),
+                    };
+                }
+                Err(e) => {
+                    last_err = format!("decode error (status {}): {}", status, e);
+                    continue;
+                }
+            }
         }
 
-        match resp.result {
-            Some(r) => Ok((r.data, r.pagination_token)),
-            None => Ok((vec![], None)),
-        }
+        Err(format!("RPC call failed after 5 attempts: {}", last_err).into())
     }
 
-    async fn fetch_sigs_in_range(
+    /// Fetch all signatures in a slot range, paginating up to max_pages.
+    async fn fetch_sigs_in_slot_range(
         &self,
         address: &str,
-        bt_gte: i64,
-        bt_lte: i64,
+        slot_gte: u64,
+        slot_lte: u64,
         max_pages: usize,
     ) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
         let mut all = Vec::new();
         let mut token: Option<String> = None;
-        let filters = Some(json!({"blockTime": {"gte": bt_gte, "lte": bt_lte}}));
+        let filters = Some(json!({"slot": {"gte": slot_gte, "lte": slot_lte}}));
         let mut pages = 0usize;
         loop {
             let (data, next) = self
-                .rpc_call(address, "signatures", "asc", 1000, token.as_deref(), filters.clone())
+                .rpc_call(address, "signatures", "asc", SIG_PAGE_LIMIT, token.as_deref(), filters.clone(), true)
                 .await?;
             let done = data.is_empty() || next.is_none();
             all.extend(data);
@@ -169,29 +241,23 @@ impl HeliusClient {
         Ok(all)
     }
 
-    async fn fetch_full_in_slot_range(
-        &self,
-        address: &str,
-        slot_gte: u64,
-        slot_lte: u64,
-    ) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut all = Vec::new();
-        let mut token: Option<String> = None;
-        let filters = Some(json!({"slot": {"gte": slot_gte, "lte": slot_lte}}));
-        loop {
-            let (data, next) = self
-                .rpc_call(address, "full", "asc", 100, token.as_deref(), filters.clone())
-                .await?;
-            let done = data.is_empty() || next.is_none();
-            all.extend(data);
-            if done { break; }
-            token = next;
-        }
-        Ok(all)
-    }
 }
 
-// ── Algorithm ──────────────────────────────────────────────────────────────
+// ── Algorithm ─────────────────────────────────────────────────────────────
+//
+// RTT 1 — Bidirectional probe (2 parallel calls, full mode, limit=100)
+//         Discovers boundaries. Short-circuits if wallet has ≤200 balance-changing txs.
+//
+// RTT 2 — 128-segment parallel sig discovery (signatures mode, limit=1000)
+//         10x more efficient per page than full mode.
+//         Most segments complete in 1 call. Overflow paginates linearly (up to 5 pages).
+//         Result: all tx signatures + slots discovered.
+//
+// RTT 3 — Parallel full tx fetch (N batches, full mode, limit=100)
+//         Group discovered sigs into batches of ~100 with non-overlapping slot ranges.
+//         Fire all batches in parallel.
+//
+// Extract — Dedup, sort by (slot, txIndex), extract pre/post balances.
 
 async fn compute_balance_timeline(
     client: &HeliusClient,
@@ -211,18 +277,20 @@ async fn compute_balance_timeline(
         phases.push(entry);
     };
 
-    // Phase 0: Probe boundaries
-    let (oldest, newest) = tokio::join!(
-        client.rpc_call(address, "signatures", "asc", 1, None, None),
-        client.rpc_call(address, "signatures", "desc", 1, None, None),
+    // ── RTT 1: Bidirectional probe (full mode, gets actual tx data) ──
+    let (asc_result, desc_result) = tokio::join!(
+        client.rpc_call(address, "full", "asc", FULL_PAGE_LIMIT, None, None, true),
+        client.rpc_call(address, "full", "desc", FULL_PAGE_LIMIT, None, None, true),
     );
-    let (oldest_data, _) = oldest?;
-    let (newest_data, _) = newest?;
+    let (asc_data, asc_next) = asc_result?;
+    let (desc_data, desc_next) = desc_result?;
 
-    log(&mut phases, "Phase 0", &format!("Boundary probe complete ({} calls)", client.calls()), &start);
+    log(&mut phases, "RTT 1", &format!(
+        "Bidirectional probe: asc={} desc={}", asc_data.len(), desc_data.len()
+    ), &start);
 
-    if oldest_data.is_empty() || newest_data.is_empty() {
-        log(&mut phases, "Phase 0", "No transactions found", &start);
+    // Empty wallet
+    if asc_data.is_empty() && desc_data.is_empty() {
         return Ok(BalanceTimeline {
             address: address.to_string(),
             points: vec![],
@@ -233,94 +301,62 @@ async fn compute_balance_timeline(
         });
     }
 
-    let first_bt = oldest_data[0]["blockTime"].as_i64().unwrap_or(0);
-    let last_bt = newest_data[0]["blockTime"].as_i64().unwrap_or(0);
-    let time_range = (last_bt - first_bt).max(1);
+    // Short-circuit: check if both probes cover everything
+    let asc_complete = asc_data.len() < FULL_PAGE_LIMIT as usize || asc_next.is_none();
+    let desc_complete = desc_data.len() < FULL_PAGE_LIMIT as usize || desc_next.is_none();
+    let asc_last_slot = asc_data.last().and_then(|d| d["slot"].as_u64()).unwrap_or(0);
+    let desc_last_slot = desc_data.last().and_then(|d| d["slot"].as_u64()).unwrap_or(u64::MAX);
+    let overlaps = asc_last_slot >= desc_last_slot;
 
-    log(&mut phases, "Phase 0", &format!("Time range: {} days ({} -> {})",
-        time_range / 86400,
-        DateTime::from_timestamp(first_bt, 0).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
-        DateTime::from_timestamp(last_bt, 0).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
-    ), &start);
-
-    // Phase 1: Density probing
-    let num_probes = ((time_range as f64 / 86400.0).ln().ceil() as usize).max(2).min(16);
-    let probe_window = (time_range / 100).max(60).min(86400);
-
-    let mut probe_futures = Vec::with_capacity(num_probes);
-    for i in 0..num_probes {
-        let frac = i as f64 / (num_probes - 1).max(1) as f64;
-        let probe_time = first_bt + (frac * time_range as f64) as i64;
-        let gte = probe_time;
-        let lte = (probe_time + probe_window).min(last_bt);
-        probe_futures.push(async move {
-            let result = client
-                .rpc_call(address, "signatures", "asc", 1000, None,
-                    Some(json!({"blockTime": {"gte": gte, "lte": lte}})))
-                .await;
-            (gte, lte, result)
+    if asc_complete || desc_complete || overlaps {
+        let mut all_txs = asc_data;
+        all_txs.extend(desc_data);
+        dedup_and_sort(&mut all_txs);
+        let total_txs = all_txs.len();
+        let points = extract_balance_points(address, &all_txs);
+        log(&mut phases, "RTT 1", &format!(
+            "Short-circuit! {} txs -> {} balance points (1 RTT)", total_txs, points.len()
+        ), &start);
+        return Ok(BalanceTimeline {
+            address: address.to_string(),
+            points,
+            phases,
+            fetch_duration_ms: start.elapsed().as_millis(),
+            rpc_calls: client.calls(),
+            total_txs_fetched: total_txs,
         });
     }
 
-    let probe_results = join_all(probe_futures).await;
+    // We have a gap between the two probes
+    let min_slot = asc_data.first().and_then(|d| d["slot"].as_u64()).unwrap_or(0);
+    let max_slot = desc_data.first().and_then(|d| d["slot"].as_u64()).unwrap_or(0);
+    let gap_start = asc_last_slot + 1;
+    let gap_end = desc_last_slot.saturating_sub(1);
+    let gap_width = gap_end.saturating_sub(gap_start) + 1;
 
-    let mut total_estimated_sigs = 0u64;
-    for (_gte, _lte, result) in &probe_results {
-        if let Ok((data, next_token)) = result {
-            let count = if data.len() >= 1000 && next_token.is_some() {
-                data.len() * 5
-            } else {
-                data.len()
-            };
-            total_estimated_sigs += count as u64;
-        }
+    if let (Some(first), Some(last)) = (asc_data.first(), desc_data.first()) {
+        let first_bt = first["blockTime"].as_i64().unwrap_or(0);
+        let last_bt = last["blockTime"].as_i64().unwrap_or(0);
+        log(&mut phases, "RTT 1", &format!(
+            "Gap: {} slots ({} days), range {} -> {}",
+            gap_width, (last_bt - first_bt) / 86400, min_slot, max_slot
+        ), &start);
     }
 
-    let avg_per_window = if num_probes > 0 {
-        total_estimated_sigs as f64 / num_probes as f64
-    } else { 1.0 };
-    let windows_in_range = time_range as f64 / probe_window as f64;
-    let estimated_total = (avg_per_window * windows_in_range) as u64;
+    // ── RTT 2: Parallel sig discovery (signatures mode, 1000/page) ──
+    // Split gap into 128 segments, fetch sigs for each in parallel.
+    // Signatures mode is 10x more efficient: 1000 sigs/page vs 100 txs/page.
+    let num_segments = INITIAL_SEGMENTS;
+    let seg_width = (gap_width / num_segments as u64).max(1);
 
-    let max_sigs: u64 = std::env::var("MAX_SIGS")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(50_000);
-    let capped = estimated_total > max_sigs;
-
-    log(&mut phases, "Phase 1", &format!(
-        "Density probe: {} probes, est ~{} sigs (avg {:.0}/window){}",
-        num_probes, estimated_total, avg_per_window,
-        if capped { format!(", capped to {}", max_sigs) } else { String::new() }
-    ), &start);
-
-    // Phase 2: Parallel sig discovery
-    let effective_total = estimated_total.min(max_sigs);
-    let target_sigs_per_chunk = 1000u64;
-
-    let num_chunks = if time_range < 604800 {
-        ((time_range / 3600) + 1).max(4).min(64) as usize
-    } else if effective_total == 0 {
-        2
-    } else {
-        ((effective_total / target_sigs_per_chunk) + 1).max(2).min(64) as usize
-    };
-
-    let (fetch_first_bt, fetch_last_bt) = if capped && estimated_total > 0 {
-        let frac = max_sigs as f64 / estimated_total as f64;
-        let shrunk_range = (time_range as f64 * frac) as i64;
-        (last_bt - shrunk_range, last_bt)
-    } else {
-        (first_bt, last_bt)
-    };
-
-    let fetch_range = (fetch_last_bt - fetch_first_bt).max(1);
-    let chunk_dur = fetch_range / num_chunks as i64;
-    let mut sig_futures = Vec::with_capacity(num_chunks);
-
-    for i in 0..num_chunks {
-        let gte = fetch_first_bt + (i as i64 * chunk_dur);
-        let lte = if i == num_chunks - 1 { fetch_last_bt + 1 }
-                  else { fetch_first_bt + ((i as i64 + 1) * chunk_dur) - 1 };
-        sig_futures.push(client.fetch_sigs_in_range(address, gte, lte, 5));
+    let mut sig_futures = Vec::with_capacity(num_segments);
+    for i in 0..num_segments {
+        let seg_start = gap_start + (i as u64 * seg_width);
+        let seg_end = if i == num_segments - 1 { gap_end }
+                      else { gap_start + ((i as u64 + 1) * seg_width) - 1 };
+        if seg_start > gap_end { break; }
+        // Up to 5 pages per segment = 5,000 sigs per segment (640k max total)
+        sig_futures.push(client.fetch_sigs_in_slot_range(address, seg_start, seg_end, 5));
     }
 
     let sig_results = join_all(sig_futures).await;
@@ -329,82 +365,92 @@ async fn compute_balance_timeline(
         all_sigs.extend(result?);
     }
 
-    let mut seen = HashSet::new();
+    // Dedup and cap sigs
+    let mut seen_sigs = HashSet::new();
     all_sigs.retain(|s| {
         let sig = s["signature"].as_str().unwrap_or("").to_string();
-        !sig.is_empty() && seen.insert(sig)
+        !sig.is_empty() && seen_sigs.insert(sig)
     });
+    all_sigs.sort_by_key(|s| s["slot"].as_u64().unwrap_or(0));
+    let capped = all_sigs.len() > MAX_SIGS;
+    if capped {
+        all_sigs.truncate(MAX_SIGS);
+    }
 
-    log(&mut phases, "Phase 2", &format!(
-        "Sig discovery: {} chunks parallel, found {} unique sigs",
-        num_chunks, all_sigs.len()
+    log(&mut phases, "RTT 2", &format!(
+        "Sig discovery: {} segments, {} unique sigs{} ({} calls)",
+        num_segments, all_sigs.len(),
+        if capped { format!(" (capped from {})", seen_sigs.len()) } else { String::new() },
+        client.calls()
     ), &start);
 
     if all_sigs.is_empty() {
+        // Only the probe data
+        let mut all_txs = asc_data;
+        all_txs.extend(desc_data);
+        dedup_and_sort(&mut all_txs);
+        let total_txs = all_txs.len();
+        let points = extract_balance_points(address, &all_txs);
         return Ok(BalanceTimeline {
             address: address.to_string(),
-            points: vec![],
+            points,
             phases,
             fetch_duration_ms: start.elapsed().as_millis(),
             rpc_calls: client.calls(),
-            total_txs_fetched: 0,
+            total_txs_fetched: total_txs,
         });
     }
 
-    all_sigs.sort_by_key(|s| s["slot"].as_u64().unwrap_or(0));
+    // ── RTT 3: Parallel full tx fetch (zero sequential pagination) ──
+    // We know every sig's slot from RTT 2. Group into batches of ~100 sigs
+    // with non-overlapping slot ranges. Fire ALL batches simultaneously.
+    // This eliminates sequential pagination entirely.
     let total_sigs = all_sigs.len();
-
-    // Phase 3: Parallel full tx fetch
     let batch_target = 100usize;
-    let num_batches = ((total_sigs + batch_target - 1) / batch_target).max(1).min(128);
+    let num_batches = ((total_sigs + batch_target - 1) / batch_target).max(1).min(MAX_FULL_BATCHES);
     let batch_size = (total_sigs + num_batches - 1) / num_batches;
 
     let mut full_futures = Vec::with_capacity(num_batches);
-    let mut prev_slot_max = 0u64;
-    for (i, chunk) in all_sigs.chunks(batch_size).enumerate() {
-        let slot_min = if i == 0 {
-            chunk.first().unwrap()["slot"].as_u64().unwrap_or(0)
-        } else {
-            prev_slot_max + 1
-        };
+    for chunk in all_sigs.chunks(batch_size) {
+        // Use the first sig's slot as range start, last sig's slot as range end
+        let slot_min = chunk.first().unwrap()["slot"].as_u64().unwrap_or(0);
         let slot_max = chunk.last().unwrap()["slot"].as_u64().unwrap_or(u64::MAX);
-        prev_slot_max = slot_max;
-        full_futures.push(client.fetch_full_in_slot_range(address, slot_min, slot_max));
+        // Single-page fetch: no pagination needed since we sized batches to ~100 sigs
+        let filters = Some(json!({"slot": {"gte": slot_min, "lte": slot_max}}));
+        full_futures.push(
+            client.rpc_call(address, "full", "asc", FULL_PAGE_LIMIT, None, filters, true)
+        );
     }
+
+    log(&mut phases, "RTT 3", &format!(
+        "Firing {} parallel single-page fetches (0 sequential pagination)",
+        num_batches
+    ), &start);
 
     let full_results = join_all(full_futures).await;
     let mut all_txs: Vec<Value> = Vec::new();
+    all_txs.extend(asc_data);
+    all_txs.extend(desc_data);
     for result in full_results {
-        all_txs.extend(result?);
+        let (data, _) = result?;
+        all_txs.extend(data);
     }
 
-    let mut seen2 = HashSet::new();
-    all_txs.retain(|tx| {
-        let sig = tx["transaction"]["signatures"][0].as_str().unwrap_or("").to_string();
-        !sig.is_empty() && seen2.insert(sig)
-    });
-
-    all_txs.sort_by(|a, b| {
-        let sa = a["slot"].as_u64().unwrap_or(0);
-        let sb = b["slot"].as_u64().unwrap_or(0);
-        let ia = a["transactionIndex"].as_u64().unwrap_or(0);
-        let ib = b["transactionIndex"].as_u64().unwrap_or(0);
-        (sa, ia).cmp(&(sb, ib))
-    });
-
-    let total_txs_fetched = all_txs.len();
-
-    log(&mut phases, "Phase 3", &format!(
-        "Full tx fetch: {} batches parallel, {} txs fetched",
-        num_batches, total_txs_fetched
+    log(&mut phases, "RTT 3", &format!(
+        "Full fetch done: {} batches, {} raw txs ({} calls)",
+        num_batches, all_txs.len(), client.calls()
     ), &start);
 
-    // Phase 4: Extract
+    // ── Extract ──
+    dedup_and_sort(&mut all_txs);
+    let total_txs = all_txs.len();
     let points = extract_balance_points(address, &all_txs);
 
-    log(&mut phases, "Phase 4", &format!(
-        "Extracted {} balance change points from {} txs",
-        points.len(), total_txs_fetched
+    log(&mut phases, "Done", &format!(
+        "{} unique txs -> {} balance points, {} RPC calls (retries: {}, slow>2s: {})",
+        total_txs, points.len(), client.calls(),
+        client.retry_count.load(Ordering::Relaxed),
+        client.slow_count.load(Ordering::Relaxed),
     ), &start);
 
     Ok(BalanceTimeline {
@@ -413,8 +459,27 @@ async fn compute_balance_timeline(
         phases,
         fetch_duration_ms: start.elapsed().as_millis(),
         rpc_calls: client.calls(),
-        total_txs_fetched,
+        total_txs_fetched: total_txs,
     })
+}
+
+fn dedup_and_sort(txs: &mut Vec<Value>) {
+    let mut seen = HashSet::new();
+    txs.retain(|tx| {
+        // Try full tx sig first, then bare sig
+        let sig = tx["transaction"]["signatures"][0].as_str()
+            .or_else(|| tx["signature"].as_str())
+            .unwrap_or("")
+            .to_string();
+        !sig.is_empty() && seen.insert(sig)
+    });
+    txs.sort_by(|a, b| {
+        let sa = a["slot"].as_u64().unwrap_or(0);
+        let sb = b["slot"].as_u64().unwrap_or(0);
+        let ia = a["transactionIndex"].as_u64().unwrap_or(0);
+        let ib = b["transactionIndex"].as_u64().unwrap_or(0);
+        (sa, ia).cmp(&(sb, ib))
+    });
 }
 
 fn extract_balance_points(address: &str, txs: &[Value]) -> Vec<BalancePoint> {
@@ -422,12 +487,36 @@ fn extract_balance_points(address: &str, txs: &[Value]) -> Vec<BalancePoint> {
     for tx in txs {
         let slot = tx["slot"].as_u64().unwrap_or(0);
         let block_time = tx["blockTime"].as_i64().unwrap_or(0);
+
         let account_keys = &tx["transaction"]["message"]["accountKeys"];
-        let idx = if let Some(keys) = account_keys.as_array() {
-            keys.iter().position(|k| {
+        let mut idx = None;
+        let mut offset = 0usize;
+
+        if let Some(keys) = account_keys.as_array() {
+            idx = keys.iter().position(|k| {
                 k.as_str() == Some(address) || k["pubkey"].as_str() == Some(address)
-            })
-        } else { None };
+            });
+            offset = keys.len();
+        }
+
+        // v0 transactions with Address Lookup Tables
+        if idx.is_none() {
+            let loaded = &tx["meta"]["loadedAddresses"];
+            if let Some(writable) = loaded["writable"].as_array() {
+                if let Some(pos) = writable.iter().position(|k| k.as_str() == Some(address)) {
+                    idx = Some(offset + pos);
+                } else {
+                    offset += writable.len();
+                }
+            }
+            if idx.is_none() {
+                if let Some(readonly) = loaded["readonly"].as_array() {
+                    if let Some(pos) = readonly.iter().position(|k| k.as_str() == Some(address)) {
+                        idx = Some(offset + pos);
+                    }
+                }
+            }
+        }
 
         if let Some(i) = idx {
             let pre = tx["meta"]["preBalances"][i].as_u64().unwrap_or(0);
@@ -476,14 +565,12 @@ async fn handle_balance_stream(
 
         match compute_balance_timeline(&client, &address).await {
             Ok(tl) => {
-                // Send each phase log
                 for phase in &tl.phases {
                     yield Ok(Event::default().event("phase").data(
                         serde_json::to_string(phase).unwrap_or_default()
                     ));
                 }
 
-                // Send summary
                 yield Ok(Event::default().event("summary").data(json!({
                     "fetch_duration_ms": tl.fetch_duration_ms,
                     "rpc_calls": tl.rpc_calls,
@@ -491,7 +578,6 @@ async fn handle_balance_stream(
                     "balance_points": tl.points.len(),
                 }).to_string()));
 
-                // Send balance data
                 yield Ok(Event::default().event("data").data(
                     serde_json::to_string(&tl.points).unwrap_or_default()
                 ));
@@ -528,15 +614,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let max_concurrent = std::env::var("MAX_CONCURRENT")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(32usize);
+    let max_concurrent: usize = std::env::var("MAX_CONCURRENT")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(128);
 
     let client = Arc::new(HeliusClient::new(&rpc_url, &api_key, max_concurrent));
 
     let mode = std::env::args().nth(1).unwrap_or_default();
 
-    if mode == "serve" {
-        // HTTP server mode
+    if mode == "query" {
+        let address = std::env::args().nth(2).expect("Usage: sol-pnl query <ADDRESS>");
+        eprintln!("─── Query: {} ───", &address[..12.min(address.len())]);
+        match compute_balance_timeline(&client, &address).await {
+            Ok(tl) => {
+                eprintln!("\n  Results:");
+                eprintln!("    Latency:    {} ms", tl.fetch_duration_ms);
+                eprintln!("    RPC calls:  {}", tl.rpc_calls);
+                eprintln!("    Txs fetched: {}", tl.total_txs_fetched);
+                eprintln!("    Bal points: {}", tl.points.len());
+                if let (Some(first), Some(last)) = (tl.points.first(), tl.points.last()) {
+                    eprintln!("    Start:      {:.9} SOL", first.sol_balance);
+                    eprintln!("    End:        {:.9} SOL", last.sol_balance);
+                }
+            }
+            Err(e) => eprintln!("    ERROR: {}", e),
+        }
+    } else if mode == "serve" {
         let port: u16 = std::env::var("PORT")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(3001);
 
@@ -553,10 +655,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  GET /api/balance/stream?address=<ADDR>   -> SSE stream with phase logs");
         axum::serve(listener, app).await?;
     } else {
-        // Benchmark mode (default)
+        // Benchmark mode
         let rpc_display = rpc_url.split('?').next().unwrap_or(&rpc_url);
         eprintln!("  RPC: {} (max {} concurrent)", rpc_display, max_concurrent);
-        eprintln!("  Tip: run with `serve` arg to start HTTP server");
+        eprintln!("  Algorithm: Probe + 128-Segment Sig Discovery + Parallel Full Fetch");
+        eprintln!("  Compression: gzip/brotli/deflate | Filter: balanceChanged");
         eprintln!();
 
         let test_addresses = vec![
@@ -565,6 +668,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ("Sparse", "HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH"),
             ("Periodic", "CKs1E69a2e9TmH4mKKLrXFF8kD3ZnwKjoEuXa6sz9WqX"),
             ("Active", "H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS"),
+            ("120k", "9ogeCJhwdQ3hLbhSqTterv5nWeetnu9Z2LxjWuN6krhq"),
         ];
 
         let mut results: Vec<(String, BalanceTimeline)> = Vec::new();

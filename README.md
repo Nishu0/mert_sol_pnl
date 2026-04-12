@@ -39,132 +39,103 @@ v3 uses **82% fewer RPC calls** than v2 (41 vs 231) and **96% fewer than naive**
 | busy (active trader) | 3 days | 4,611 | 4,606 | 10.7s | 186 |
 | target wallet | 437 days | 1,021 | 778 | 6.9s | 41 |
 
-## Algorithm: Adaptive Parallel Two-Phase with balanceChanged Filter
+## Algorithm: Bidirectional Probe + 128-Segment Sig Discovery + Zero-Pagination Full Fetch
 
 ### why this design
 
-the bottleneck is **network I/O** (~200-500ms per RPC round-trip). computation is negligible (<3ms). so the entire optimization problem reduces to: **minimize the longest sequential chain of RPC calls.**
+the bottleneck is **network I/O** (~200-500ms per RPC round-trip). computation is negligible (<3ms). so the entire optimization problem reduces to: **eliminate all sequential call chains.**
 
-key insight: `getTransactionsForAddress` supports `tokenAccounts: "balanceChanged"` which filters server-side to only return transactions where any balance (SOL or token) actually changed. this is a massive reduction — a wallet might have 10,000 txs but only 800 that change its SOL balance.
+two key insights:
+1. `getTransactionsForAddress` supports `tokenAccounts: "balanceChanged"` — server-side filter that only returns transactions where any balance changed. a wallet might have 100,000 txs but only 10,000 that change its SOL balance.
+2. signatures mode (1000/page) is 10x more efficient than full mode (100/page). use signatures to discover *what* to fetch, then full mode to fetch *only what you need* — all in parallel with zero sequential pagination.
 
-### the 4 phases
+### the 3 RTTs
 
 ```
-                    ┌─────────────────────────────────────────────┐
-   Phase 0          │  boundary probe (2 parallel calls)          │
-   1 RTT            │  → minSlot, maxSlot, time range             │
-                    └──────────────────┬──────────────────────────┘
+                    ┌─────────────────────────────────────────────────┐
+   RTT 1            │  bidirectional probe (2 parallel calls)         │
+   2 calls          │  full mode, limit=100, asc + desc              │
+                    │  → discovers boundaries, short-circuits ≤200 txs│
+                    └──────────────────┬──────────────────────────────┘
                                        │
-                    ┌──────────────────▼──────────────────────────┐
-   Phase 1          │  density estimation (7 parallel probes)     │
-   1 RTT            │  → estimated total sigs, optimal chunk count│
-                    └──────────────────┬──────────────────────────┘
+                    ┌──────────────────▼──────────────────────────────┐
+   RTT 2            │  128-segment parallel sig discovery             │
+   128+ calls       │  signatures mode, 1000/page, balanceChanged    │
+                    │  → all tx signatures + slots discovered         │
+                    └──────────────────┬──────────────────────────────┘
                                        │
-                    ┌──────────────────▼──────────────────────────┐
-   Phase 2          │  parallel sig discovery (N chunks)          │
-   1-2 RTTs         │  signatures mode, 1000/page, balanceChanged │
-                    │  → all tx slots + sigs discovered           │
-                    └──────────────────┬──────────────────────────┘
+                    ┌──────────────────▼──────────────────────────────┐
+   RTT 3            │  zero-pagination parallel full fetch            │
+   N calls          │  ~100-sig batches, non-overlapping slot ranges  │
+                    │  → ALL batches fire simultaneously, no pagination│
+                    └──────────────────┬──────────────────────────────┘
                                        │
-                    ┌──────────────────▼──────────────────────────┐
-   Phase 3          │  parallel full tx fetch (M batches)         │
-   1-3 RTTs         │  full mode, 100/page, non-overlapping slots │
-                    │  → complete pre/post balance data            │
-                    └──────────────────┬──────────────────────────┘
-                                       │
-                    ┌──────────────────▼──────────────────────────┐
-   Phase 4          │  dedup → sort → extract balance curve       │
-   0 RTTs           │  → chronological (timestamp, sol_balance)   │
-                    └─────────────────────────────────────────────┘
+                    ┌──────────────────▼──────────────────────────────┐
+   Extract          │  dedup → sort → extract balance curve           │
+   0 RTTs           │  → chronological (timestamp, sol_balance)       │
+                    └─────────────────────────────────────────────────┘
 ```
 
-### phase 0: boundary probe (1 RTT, 2 calls)
+### RTT 1: bidirectional probe (2 calls)
 
-fire two calls in parallel:
-- `sortOrder: "asc", limit: 1, balanceChanged` → oldest balance-changing tx
-- `sortOrder: "desc", limit: 1, balanceChanged` → newest balance-changing tx
+fire two full-mode calls in parallel:
+- `sortOrder: "asc", limit: 100, balanceChanged` → oldest 100 balance-changing txs
+- `sortOrder: "desc", limit: 100, balanceChanged` → newest 100 balance-changing txs
 
-gives us the exact slot range and time range. if wallet has zero txs, done in 1 RTT.
+**short-circuit conditions** (all handled in RTT 1):
+- either side returns < 100 txs → we've seen everything in that direction
+- asc's last slot >= desc's last slot → the two ends overlap, nothing in between
+- wallet has zero txs → done immediately
 
-### phase 1: density estimation (1 RTT, 7 calls)
+for any wallet with ≤ 200 balance-changing transactions, the entire job finishes in 1 RTT.
 
-fire 7 parallel probes at log-spaced intervals across the time range. each probe fetches 1 page of signatures (limit=1000) in a small time window (1% of total range).
+### RTT 2: 128-segment parallel sig discovery (128+ calls)
 
-from the probe counts, extrapolate total expected transaction count. this determines how many parallel chunks to use in phase 2.
+if there's a gap between the two probes, split it into 128 equal-width slot segments. fire all segments in parallel using signatures mode (1000/page) with `balanceChanged` filter.
 
-**density-adaptive chunking:**
-- < 1 week time range → 1 chunk per hour (aggressive parallelism)
-- estimated < 1000 sigs → 2 chunks
-- estimated 1000-50000 sigs → 1 chunk per 1000 estimated sigs
-- capped at 64 chunks max
+signatures mode is 10x more efficient per page than full mode (1000 vs 100 per page). most segments complete in a single call. overflow segments paginate up to 5 pages each.
 
-if a probe returns 1000 (page limit) with a pagination token, the window is saturated — we multiply the estimate by 5x to avoid underestimating dense regions.
+result: a deduplicated, sorted list of all transaction signatures and their slots. capped at 200k sigs for safety on token-heavy wallets.
 
-### phase 2: parallel sig discovery (1-2 RTTs, ~10 calls)
+### RTT 3: zero-pagination parallel full fetch (N calls)
 
-split the time range into N chunks (determined by phase 1). fire all chunks in parallel. each chunk fetches signatures mode (1000/page) with `balanceChanged` filter, paginating up to 5 pages per chunk.
+this is the key optimization. instead of creating 128 segments that paginate sequentially (which creates O(pages_per_segment) sequential RTTs per segment), we use the sig discovery results to create **pre-sized batches that each fit in a single page**.
 
-signatures mode is 10x more efficient than full mode (1000 vs 100 per page), so this phase discovers all transaction slots with minimal calls.
+group the discovered sigs into batches of ~100. each batch uses the first/last sig's slot as its `slot: {gte, lte}` filter. fire ALL batches simultaneously — zero sequential pagination anywhere.
 
-result: a deduplicated, sorted list of all transaction slots.
+for a wallet with 128k balance-changing sigs, this fires ~1,290 parallel single-page fetches instead of 128 segments × 10 sequential pages each.
 
-### phase 3: parallel full tx fetch (1-3 RTTs, ~22 calls)
+### extract: balance curve (0 RTTs, <3ms)
 
-group discovered sigs into batches of ~100 (1 page of full data each). assign non-overlapping slot ranges to each batch to avoid duplicate fetches.
-
-fire all batches in parallel with up to 64 concurrent connections.
-
-each batch uses `balanceChanged` filter + slot range filter + `encoding: jsonParsed` to get complete `preBalances`/`postBalances` arrays.
-
-### phase 4: extract balance curve (0 RTTs, <3ms)
-
-1. collect all txs from all phases
+1. merge all txs from RTT 1 probe + RTT 3 full fetch
 2. deduplicate by transaction signature (HashSet)
 3. sort by `(slot, transactionIndex)` — deterministic ordering
-4. for each tx, find our address in `accountKeys`, read `preBalances[i]` and `postBalances[i]`
-5. emit `(blockTime, postBalance)` only where `pre != post`
+4. for each tx, find wallet address in `accountKeys` + `loadedAddresses` (handles v0 ALT txs)
+5. read `preBalances[i]` and `postBalances[i]`, emit point only where `pre != post`
 
-done — complete balance-over-time curve.
+### wire-level optimizations
 
-### RPC features we exploit
+- **gzip/brotli/deflate compression**: ~7x wire payload reduction per call
+- **16 HTTP clients**: multiple TCP connections to avoid HTTP/2 multiplexing bottleneck
+- **128 max concurrent requests**: saturates connection pool from the first wave
+- **exponential backoff retries**: handles 429 rate limits and transient server errors
+
+### RPC features exploited
 
 | feature | how we use it | impact |
 |---|---|---|
-| `tokenAccounts: "balanceChanged"` | server-side filter on all calls | 82% fewer RPC calls |
-| `slot: {gte, lte}` range filters | non-overlapping parallel batch ranges | eliminates duplicate fetches |
-| `sortOrder: "asc"/"desc"` | boundary probe from both ends | 1 RTT for exact slot range |
-| signatures mode (limit 1000) | phase 2 sig discovery | 10x fewer pages than full mode |
-| pagination token `"slot:txIndex"` | synthetic tokens for mid-range jumps | parallelizes dense regions |
+| `tokenAccounts: "balanceChanged"` | server-side filter on sig discovery + probe | only discover balance-changing txs |
+| `slot: {gte, lte}` range filters | non-overlapping parallel batch ranges | zero duplicate fetches |
+| `sortOrder: "asc"/"desc"` | bidirectional probe from both ends | 1 RTT boundary discovery + short-circuit |
+| signatures mode (limit 1000) | RTT 2 sig discovery | 10x fewer pages than full mode |
+| full mode (limit 100) | RTT 3 targeted fetch | only fetch txs we know exist |
 
-### why this beats alternatives
+### correctness
 
-**vs naive sequential (getSignaturesForAddress + getTransaction):**
-- naive: N sequential pages × 2 calls each = 2N sequential RTTs
-- ours: 4 parallel phases, longest chain ~5 RTTs for 1000 txs
-- speedup: ~200x for the target wallet
-
-**vs pure full-mode parallel chunking (no sig discovery):**
-- full mode limit=100 means 10x more pages for the same data
-- adding sig discovery phase costs 1 RTT but saves 5-10 RTTs in fetch phase
-
-**vs continuity pruning only (no sig discovery):**
-- continuity pruning works great for sparse wallets (prunes 70-90% of timeline)
-- but for evenly-distributed wallets (like the target), 0 gaps get pruned
-- sig discovery + parallel batch fetch handles both cases
-
-**vs batched JSON-RPC probing:**
-- we tested batching 32 probe calls into 1 HTTP request
-- server-side processing of the batch was slower than 32 parallel individual calls
-- network-level parallelism (64 TCP connections) beats RPC-level batching
-
-### theoretical minimum latency
-
-for a wallet with N balance-changing transactions:
-- minimum RPC calls: `ceil(N/1000)` (sig discovery) + `ceil(N/100)` (full fetch) + 2 (boundary) + 7 (probes) ≈ `N/100 + N/1000 + 9`
-- minimum RTTs: `ceil(max_pages_per_chunk)` where chunks run in parallel
-- for N=1000: min ~19 calls, min ~2-3 RTTs ≈ 600-900ms theoretical floor
-
-our actual: 41 calls, ~6.9s. the gap is mostly RPC server-side latency (200-500ms per call) and the fact that we're querying a remote endpoint, not a local node.
+- **address lookup tables**: `preBalances`/`postBalances` are indexed by `[...accountKeys, ...loadedAddresses.writable, ...loadedAddresses.readonly]`. for v0 transactions using an ALT, the wallet may only appear in `loadedAddresses` — the extractor searches all three arrays.
+- **dedup**: transactions deduplicated on their first signature using `HashSet<String>` across all phases.
+- **sort key**: `(slot, transactionIndex)` for deterministic ordering when multiple txs land in the same slot.
+- **failed transactions**: included via `balanceChanged` filter — failed txs still pay fees and their pre/post diff is the real fee delta.
 
 ## Architecture
 
